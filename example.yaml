@@ -1,0 +1,30 @@
+---
+substitutions:
+    name: arylic-bp50
+    friendly_name: Arylic BP50
+    bp50_mac: "AA:BB:CC:DD:EE:FF"
+
+esphome:
+    name: ${name}
+    friendly_name: ${friendly_name}
+
+esp32:
+    board: esp32-c3-devkitm-1
+    framework:
+        type: esp-idf
+
+logger:
+
+api:
+    encryption:
+        key: !secret api_encryption_key
+
+ota:
+    - platform: esphome
+
+wifi:
+    ssid: !secret wifi_ssid
+    password: !secret wifi_password
+
+packages:
+    arylic_bp50: github://rtuszik/esphome-arylic-bp50/arylic-bp50.yaml@main

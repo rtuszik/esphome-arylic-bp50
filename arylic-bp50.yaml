@@ -1,0 +1,229 @@
+---
+# Arylic BP50 Bluetooth control for ESPHome
+# https://github.com/rtuszik/esphome-arylic-bp50
+#
+# Include as a package and set `bp50_mac` in your main config's substitutions.
+
+substitutions:
+    bp50_mac: "00:00:00:00:00:00"
+    bp50_poll_interval: 60s
+    bp50_svc_uuid: 52414b4f-4954-11eb-8410-f7496d45b300
+    bp50_tx_uuid: 52414b4f-4954-11eb-8410-f7496d45b301
+    bp50_rx_uuid: 52414b4f-4954-11eb-8410-f7496d45b302
+
+esp32_ble_tracker:
+    on_ble_advertise:
+        - then:
+            - lambda: |-
+                static std::set<uint64_t> seen;
+                std::string n = x.get_name().str();
+                if (n.empty() || seen.count(x.address_uint64())) return;
+                if (n.find("50") != std::string::npos || n.find("rylic") != std::string::npos) {
+                  seen.insert(x.address_uint64());
+                  char mac[18];
+                  ESP_LOGI("bp50", "Candidate: %s  %s  rssi=%d", x.address_str_to(mac), n.c_str(), x.get_rssi());
+                }
+
+ble_client:
+    - id: bp50
+      mac_address: ${bp50_mac}
+      on_connect:
+        - binary_sensor.template.publish: {id: bp50_connected, state: true}
+        - delay: 1s
+        - script.execute: {id: bp50_send, cmd: "VER;"}
+        - script.execute: {id: bp50_send, cmd: "LST;"}
+        - script.execute: bp50_refresh
+      on_disconnect:
+        - binary_sensor.template.publish: {id: bp50_connected, state: false}
+
+script:
+    - id: bp50_send
+      mode: queued
+      max_runs: 30
+      parameters:
+        cmd: string
+      then:
+        - lambda: 'ESP_LOGI("bp50", "-> %s", cmd.c_str());'
+        - ble_client.ble_write:
+            id: bp50
+            service_uuid: ${bp50_svc_uuid}
+            characteristic_uuid: ${bp50_tx_uuid}
+            value: !lambda "return std::vector<uint8_t>(cmd.begin(), cmd.end());"
+        - delay: 100ms
+    - id: bp50_refresh
+      then:
+        - script.execute: {id: bp50_send, cmd: "VOL;"}
+        - script.execute: {id: bp50_send, cmd: "SRC;"}
+        - script.execute: {id: bp50_send, cmd: "BAS;"}
+        - script.execute: {id: bp50_send, cmd: "TRE;"}
+        - script.execute: {id: bp50_send, cmd: "LED;"}
+
+interval:
+    - interval: ${bp50_poll_interval}
+      then:
+        - if:
+            condition:
+                binary_sensor.is_on: bp50_connected
+            then:
+                - script.execute: bp50_refresh
+
+sensor:
+    - platform: ble_client
+      type: characteristic
+      ble_client_id: bp50
+      id: bp50_rx
+      internal: true
+      service_uuid: ${bp50_svc_uuid}
+      characteristic_uuid: ${bp50_rx_uuid}
+      notify: true
+      update_interval: never
+      lambda: |-
+        static std::string buf;
+        buf.append(x.begin(), x.end());
+        size_t pos;
+        while ((pos = buf.find(';')) != std::string::npos) {
+          std::string msg = buf.substr(0, pos);
+          buf.erase(0, pos + 1);
+          auto start = msg.find_first_not_of("\r\n ");
+          if (start == std::string::npos) continue;
+          msg.erase(0, start);
+          ESP_LOGI("bp50", "<- %s", msg.c_str());
+          id(bp50_last).publish_state(msg);
+          auto c = msg.find(':');
+          if (c == std::string::npos) continue;
+          std::string key = msg.substr(0, c), val = msg.substr(c + 1);
+          float f = atof(val.c_str());
+          if (key == "VOL") id(bp50_volume).publish_state(f);
+          else if (key == "BAS") id(bp50_bass).publish_state(f);
+          else if (key == "TRE") id(bp50_treble).publish_state(f);
+          else if (key == "LED") id(bp50_led).publish_state(val == "1");
+          else if (key == "LST") id(bp50_sources).publish_state(val);
+          else if (key == "VER") id(bp50_version).publish_state(val);
+          else if (key == "SRC") {
+            if (id(bp50_source).has_option(val)) id(bp50_source).publish_state(val);
+            else ESP_LOGW("bp50", "Unknown source '%s', add it to the select options", val.c_str());
+          }
+        }
+        if (buf.size() > 256) buf.clear();
+        return NAN;
+
+binary_sensor:
+    - platform: template
+      id: bp50_connected
+      name: Connected
+      device_class: connectivity
+
+text_sensor:
+    - platform: template
+      id: bp50_sources
+      name: Available inputs
+      entity_category: diagnostic
+    - platform: template
+      id: bp50_version
+      name: Firmware
+      entity_category: diagnostic
+    - platform: template
+      id: bp50_last
+      name: Last response
+      entity_category: diagnostic
+
+text:
+    - platform: template
+      id: bp50_raw
+      name: Raw command
+      mode: text
+      optimistic: true
+      entity_category: config
+      set_action:
+        - script.execute:
+            id: bp50_send
+            cmd: !lambda |-
+                std::string c = x;
+                if (!c.empty() && c.back() != ';') c += ';';
+                return c;
+
+number:
+    - platform: template
+      id: bp50_volume
+      name: Volume
+      icon: mdi:volume-high
+      min_value: 0
+      max_value: 100
+      step: 1
+      optimistic: true
+      set_action:
+        - script.execute: {id: bp50_send, cmd: !lambda 'return "VOL:" + to_string((int) x) + ";";'}
+    - platform: template
+      id: bp50_bass
+      name: Bass
+      min_value: -10
+      max_value: 10
+      step: 1
+      optimistic: true
+      entity_category: config
+      set_action:
+        - script.execute: {id: bp50_send, cmd: !lambda 'return "BAS:" + to_string((int) x) + ";";'}
+    - platform: template
+      id: bp50_treble
+      name: Treble
+      min_value: -10
+      max_value: 10
+      step: 1
+      optimistic: true
+      entity_category: config
+      set_action:
+        - script.execute: {id: bp50_send, cmd: !lambda 'return "TRE:" + to_string((int) x) + ";";'}
+
+select:
+    - platform: template
+      id: bp50_source
+      name: Input
+      icon: mdi:import
+      optimistic: true
+      options: [BT, LINE-IN, PHONO, OPT, HDMI, USBDAC, USBPLAY]
+      set_action:
+        - script.execute: {id: bp50_send, cmd: !lambda 'return "SRC:" + x + ";";'}
+
+switch:
+    - platform: ble_client
+      id: bp50_link
+      ble_client_id: bp50
+      name: BLE link
+      icon: mdi:bluetooth-connect
+      restore_mode: ALWAYS_ON
+    - platform: template
+      id: bp50_led
+      name: LEDs
+      optimistic: true
+      restore_mode: DISABLED
+      entity_category: config
+      turn_on_action:
+        - script.execute: {id: bp50_send, cmd: "LED:1;"}
+      turn_off_action:
+        - script.execute: {id: bp50_send, cmd: "LED:0;"}
+
+button:
+    - platform: template
+      id: bp50_play_pause
+      name: Play Pause
+      icon: mdi:play-pause
+      on_press:
+        - script.execute: {id: bp50_send, cmd: "POP;"}
+    - platform: template
+      id: bp50_next
+      name: Next
+      icon: mdi:skip-next
+      on_press:
+        - script.execute: {id: bp50_send, cmd: "NXT;"}
+    - platform: template
+      id: bp50_previous
+      name: Previous
+      icon: mdi:skip-previous
+      on_press:
+        - script.execute: {id: bp50_send, cmd: "PRE;"}
+    - platform: template
+      id: bp50_refresh_button
+      name: Refresh
+      entity_category: diagnostic
+      on_press:
+        - script.execute: bp50_refresh
